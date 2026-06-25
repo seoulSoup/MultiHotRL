@@ -1,5 +1,8 @@
-import json
+import os
+import time
+import argparse
 import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,152 +10,95 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # =========================================================
-# 1. Vocabulary
+# Dataset
 # =========================================================
 
-def build_vocab(equipment_list):
-    pin_set = set()
-    part_set = set()
+class PinPartAssignDataset(Dataset):
+    """
+    X shape: (N, 44)
+    value:
+        -1   = no connection
+        0~16 = part id
+    """
 
-    for eq in equipment_list:
-        for pin, part in eq.items():
-            pin_set.add(str(pin))
-            part_set.add(str(part))
+    def __init__(self, npy_path, mmap=True):
+        self.X = np.load(npy_path, mmap_mode="r" if mmap else None)
 
-    pin2id = {p: i for i, p in enumerate(sorted(pin_set))}
-    part2id = {p: i for i, p in enumerate(sorted(part_set))}
-
-    return pin2id, part2id
-
-
-def save_vocab(pin2id, part2id, path="equipment_vocab.json"):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "pin2id": pin2id,
-                "part2id": part2id,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-
-def load_vocab(path="equipment_vocab.json"):
-    with open(path, "r", encoding="utf-8") as f:
-        obj = json.load(f)
-
-    return obj["pin2id"], obj["part2id"]
-
-
-# =========================================================
-# 2. Dataset
-# =========================================================
-
-class EquipmentPairDataset(Dataset):
-    def __init__(self, equipment_list, pin2id, part2id):
-        self.samples = []
-
-        for eq in equipment_list:
-            pairs = []
-
-            for pin, part in eq.items():
-                pin = str(pin)
-                part = str(part)
-
-                if pin not in pin2id or part not in part2id:
-                    continue
-
-                pairs.append([
-                    part2id[part],
-                    pin2id[pin]
-                ])
-
-            if len(pairs) == 0:
-                pairs = [[0, 0]]
-
-            self.samples.append(
-                torch.tensor(pairs, dtype=torch.long)
-            )
+        assert self.X.ndim == 2, self.X.shape
+        assert self.X.shape[1] == 44, self.X.shape
 
     def __len__(self):
-        return len(self.samples)
+        return self.X.shape[0]
 
     def __getitem__(self, idx):
-        return self.samples[idx]
-
-
-def collate_pairs(batch):
-    """
-    batch: list of (num_connections, 2)
-    return:
-        pair_ids: (B, Lmax, 2)
-        mask:     (B, Lmax)
-    """
-    B = len(batch)
-    max_len = max(x.size(0) for x in batch)
-
-    pair_ids = torch.zeros(B, max_len, 2, dtype=torch.long)
-    mask = torch.zeros(B, max_len, dtype=torch.float32)
-
-    for i, pairs in enumerate(batch):
-        L = pairs.size(0)
-        pair_ids[i, :L] = pairs
-        mask[i, :L] = 1.0
-
-    return pair_ids, mask
+        x = np.asarray(self.X[idx], dtype=np.int64)
+        return torch.from_numpy(x)
 
 
 # =========================================================
-# 3. Model
+# Encoder
 # =========================================================
 
-class EquipmentEmbedder(nn.Module):
+class PinPartAssignEncoder(nn.Module):
     def __init__(
         self,
-        num_parts,
-        num_pins,
+        num_parts=17,
+        num_pins=44,
         emb_dim=32,
-        pair_hidden_dim=64,
+        hidden_dim=64,
         out_dim=32,
     ):
         super().__init__()
 
-        self.part_emb = nn.Embedding(num_parts, emb_dim)
+        self.num_parts = num_parts
+        self.num_pins = num_pins
+        self.none_id = num_parts
+
+        self.part_emb = nn.Embedding(num_parts + 1, emb_dim)
         self.pin_emb = nn.Embedding(num_pins, emb_dim)
 
         self.pair_mlp = nn.Sequential(
-            nn.Linear(emb_dim * 2, pair_hidden_dim),
+            nn.Linear(emb_dim * 2, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(pair_hidden_dim),
-            nn.Linear(pair_hidden_dim, emb_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, emb_dim),
             nn.ReLU(),
         )
 
         self.out_proj = nn.Sequential(
-            nn.Linear(emb_dim, 64),
+            nn.Linear(emb_dim, hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, out_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_dim),
         )
 
-    def forward(self, pair_ids, mask):
+    def forward(self, assign):
         """
-        pair_ids: (B, L, 2)
-                  pair_ids[..., 0] = part_id
-                  pair_ids[..., 1] = pin_id
-
-        mask: (B, L)
+        assign: (B, 44), -1 or 0~16
         """
 
-        part_ids = pair_ids[..., 0]
-        pin_ids = pair_ids[..., 1]
+        B, num_pins = assign.shape
+        device = assign.device
+
+        mask = (assign >= 0).float()
+
+        part_ids = torch.where(
+            assign >= 0,
+            assign,
+            torch.full_like(assign, self.none_id),
+        )
+
+        pin_ids = torch.arange(num_pins, device=device)
+        pin_ids = pin_ids.unsqueeze(0).expand(B, -1)
 
         part_e = self.part_emb(part_ids)
         pin_e = self.pin_emb(pin_ids)
 
-        token = torch.cat([part_e, pin_e], dim=-1)
-        token = self.pair_mlp(token)
+        pair_input = torch.cat([part_e, pin_e], dim=-1)
+        token = self.pair_mlp(pair_input)
+
+        # 동일 pin 사용성을 강조
+        token = token + pin_e
 
         token = token * mask.unsqueeze(-1)
 
@@ -167,106 +113,154 @@ class EquipmentEmbedder(nn.Module):
 
 
 # =========================================================
-# 4. Target similarity
+# Similarity
 # =========================================================
 
-def batch_jaccard_similarity(pair_ids, mask):
+def batch_domain_similarity_from_assign(
+    assign,
+    num_parts=17,
+    w_pin=0.7,
+    w_pair=0.2,
+    w_part=0.1,
+):
     """
-    연결 pair set 기준 Jaccard similarity.
-    같은 (part, pin) pair가 얼마나 겹치는지 측정.
+    assign: (B, 44)
+
+    similarity =
+        0.7 * same pin usage
+      + 0.2 * exact pin-part pair
+      + 0.1 * same part usage
     """
 
-    B, L, _ = pair_ids.shape
-    sim = torch.zeros(B, B, device=pair_ids.device)
+    B, num_pins = assign.shape
+    device = assign.device
 
-    sets = []
+    conn = (assign >= 0).float()
 
-    pair_ids_cpu = pair_ids.detach().cpu()
-    mask_cpu = mask.detach().cpu()
+    # 1. pin Jaccard
+    pin_inter = conn @ conn.T
+    pin_count = conn.sum(dim=1, keepdim=True)
+    pin_union = pin_count + pin_count.T - pin_inter
+    pin_sim = pin_inter / pin_union.clamp(min=1.0)
 
-    for i in range(B):
-        valid = mask_cpu[i].bool()
-        pairs = pair_ids_cpu[i, valid]
-        pair_set = set(
-            (int(p[0]), int(p[1]))
-            for p in pairs
-        )
-        sets.append(pair_set)
+    # 2. exact pair Jaccard
+    same_part = assign.unsqueeze(1) == assign.unsqueeze(0)
+    both_conn = (assign.unsqueeze(1) >= 0) & (assign.unsqueeze(0) >= 0)
 
-    for i in range(B):
-        for j in range(B):
-            inter = len(sets[i] & sets[j])
-            union = len(sets[i] | sets[j])
-            sim[i, j] = inter / union if union > 0 else 0.0
+    pair_inter = (same_part & both_conn).float().sum(dim=-1)
+    pair_count = conn.sum(dim=1, keepdim=True)
+    pair_union = pair_count + pair_count.T - pair_inter
+    pair_sim = pair_inter / pair_union.clamp(min=1.0)
+
+    # 3. part Jaccard
+    part_present = torch.zeros(
+        B,
+        num_parts,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    valid = assign >= 0
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, num_pins)
+
+    part_present[
+        batch_idx[valid],
+        assign[valid].long(),
+    ] = 1.0
+
+    part_inter = part_present @ part_present.T
+    part_count = part_present.sum(dim=1, keepdim=True)
+    part_union = part_count + part_count.T - part_inter
+    part_sim = part_inter / part_union.clamp(min=1.0)
+
+    sim = (
+        w_pin * pin_sim
+        + w_pair * pair_sim
+        + w_part * part_sim
+    )
 
     return sim
 
 
 # =========================================================
-# 5. Train
+# Train
 # =========================================================
 
-def train_equipment_embedder(
-    equipment_list,
+def train(
+    npy_path,
+    save_path,
+    num_parts=17,
+    num_pins=44,
     emb_dim=32,
+    hidden_dim=64,
     out_dim=32,
-    batch_size=256,
-    epochs=100,
-    lr=1e-3,
-    weight_decay=1e-4,
-    save_model_path="equipment_embedder.pt",
-    save_vocab_path="equipment_vocab.json",
-    device=None,
+    batch_size=512,
+    epochs=3,
+    lr=5e-4,
+    num_workers=0,
+    max_steps_per_epoch=None,
 ):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device("cpu")
 
-    pin2id, part2id = build_vocab(equipment_list)
-    save_vocab(pin2id, part2id, save_vocab_path)
+    torch.set_num_threads(max(1, os.cpu_count() // 2))
 
-    dataset = EquipmentPairDataset(
-        equipment_list,
-        pin2id,
-        part2id
-    )
+    dataset = PinPartAssignDataset(npy_path, mmap=True)
 
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=collate_pairs,
-        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=False,
+        drop_last=True,
     )
 
-    model = EquipmentEmbedder(
-        num_parts=len(part2id),
-        num_pins=len(pin2id),
+    model = PinPartAssignEncoder(
+        num_parts=num_parts,
+        num_pins=num_pins,
         emb_dim=emb_dim,
+        hidden_dim=hidden_dim,
         out_dim=out_dim,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
-        weight_decay=weight_decay
+        weight_decay=1e-4,
     )
+
+    print("=================================================")
+    print("CPU Pin-Part Embedding Pretrain")
+    print("data:", npy_path)
+    print("N:", len(dataset))
+    print("batch_size:", batch_size)
+    print("emb_dim:", emb_dim)
+    print("out_dim:", out_dim)
+    print("epochs:", epochs)
+    print("threads:", torch.get_num_threads())
+    print("=================================================")
 
     for epoch in range(1, epochs + 1):
         model.train()
+
         total_loss = 0.0
         total_n = 0
+        start = time.time()
 
-        for pair_ids, mask in loader:
-            pair_ids = pair_ids.to(device)
-            mask = mask.to(device)
+        for step, assign in enumerate(loader, start=1):
+            assign = assign.to(device)
 
-            z = model(pair_ids, mask)
+            z = model(assign)
             pred_sim = z @ z.T
 
-            target_sim = batch_jaccard_similarity(
-                pair_ids,
-                mask
-            )
+            with torch.no_grad():
+                target_sim = batch_domain_similarity_from_assign(
+                    assign,
+                    num_parts=num_parts,
+                    w_pin=0.7,
+                    w_pair=0.2,
+                    w_part=0.1,
+                )
 
             loss = F.mse_loss(pred_sim, target_sim)
 
@@ -274,202 +268,161 @@ def train_equipment_embedder(
             loss.backward()
             optimizer.step()
 
-            bs = pair_ids.size(0)
+            bs = assign.size(0)
             total_loss += loss.item() * bs
             total_n += bs
 
-        avg_loss = total_loss / total_n
+            if step % 100 == 0:
+                elapsed = time.time() - start
+                print(
+                    f"[Epoch {epoch:03d} | Step {step:06d}] "
+                    f"loss={total_loss / total_n:.6f} "
+                    f"elapsed={elapsed:.1f}s"
+                )
 
-        if epoch == 1 or epoch % 10 == 0:
-            print(f"[Epoch {epoch:03d}] loss = {avg_loss:.6f}")
+            if max_steps_per_epoch is not None:
+                if step >= max_steps_per_epoch:
+                    break
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "num_parts": len(part2id),
-            "num_pins": len(pin2id),
-            "emb_dim": emb_dim,
-            "out_dim": out_dim,
-        },
-        save_model_path
-    )
+        avg_loss = total_loss / max(total_n, 1)
+        elapsed = time.time() - start
 
-    print(f"Saved model: {save_model_path}")
-    print(f"Saved vocab: {save_vocab_path}")
+        print(
+            f"[Epoch {epoch:03d} Done] "
+            f"loss={avg_loss:.6f} "
+            f"time={elapsed:.1f}s"
+        )
 
-    return model, pin2id, part2id
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "num_parts": num_parts,
+                "num_pins": num_pins,
+                "emb_dim": emb_dim,
+                "hidden_dim": hidden_dim,
+                "out_dim": out_dim,
+                "epoch": epoch,
+                "loss": avg_loss,
+            },
+            save_path,
+        )
 
-
-# =========================================================
-# 6. Load / Transform
-# =========================================================
-
-def load_equipment_embedder(
-    model_path="equipment_embedder.pt",
-    device=None,
-):
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    ckpt = torch.load(model_path, map_location=device)
-
-    model = EquipmentEmbedder(
-        num_parts=ckpt["num_parts"],
-        num_pins=ckpt["num_pins"],
-        emb_dim=ckpt["emb_dim"],
-        out_dim=ckpt["out_dim"],
-    ).to(device)
-
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+        print(f"saved: {save_path}")
 
     return model
 
 
-@torch.no_grad()
-def transform_equipment(
-    equipment_list,
-    model,
-    pin2id,
-    part2id,
-    batch_size=512,
-    device=None,
-):
-    if device is None:
-        device = next(model.parameters()).device
+# =========================================================
+# Transform
+# =========================================================
 
-    dataset = EquipmentPairDataset(
-        equipment_list,
-        pin2id,
-        part2id
+@torch.no_grad()
+def transform_to_embedding(
+    npy_path,
+    ckpt_path,
+    out_npy_path,
+    batch_size=4096,
+):
+    device = torch.device("cpu")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    model = PinPartAssignEncoder(
+        num_parts=ckpt["num_parts"],
+        num_pins=ckpt["num_pins"],
+        emb_dim=ckpt["emb_dim"],
+        hidden_dim=ckpt["hidden_dim"],
+        out_dim=ckpt["out_dim"],
     )
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    dataset = PinPartAssignDataset(npy_path, mmap=True)
 
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_pairs,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
     )
 
-    embeddings = []
+    Z = np.memmap(
+        out_npy_path,
+        dtype=np.float32,
+        mode="w+",
+        shape=(len(dataset), ckpt["out_dim"]),
+    )
 
-    model.eval()
+    offset = 0
 
-    for pair_ids, mask in loader:
-        pair_ids = pair_ids.to(device)
-        mask = mask.to(device)
+    for step, assign in enumerate(loader, start=1):
+        z = model(assign).numpy().astype(np.float32)
 
-        z = model(pair_ids, mask)
-        embeddings.append(z.cpu())
+        bs = z.shape[0]
+        Z[offset:offset + bs] = z
+        offset += bs
 
-    return torch.cat(embeddings, dim=0).numpy()
+        if step % 100 == 0:
+            print(f"transform step={step}, offset={offset}")
+
+    Z.flush()
+    print("saved embedding memmap:", out_npy_path)
+    print("shape:", (len(dataset), ckpt["out_dim"]))
 
 
 # =========================================================
-# 7. Example
+# Main
 # =========================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--mode", type=str, default="train")
+    parser.add_argument("--npy_path", type=str, required=True)
+    parser.add_argument("--save_path", type=str, default="pinpart_encoder_cpu.pt")
+    parser.add_argument("--out_npy_path", type=str, default="pinpart_embedding.dat")
+
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=5e-4)
+
+    parser.add_argument("--emb_dim", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--out_dim", type=int, default=32)
+
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_steps_per_epoch", type=int, default=None)
+
+    args = parser.parse_args()
+
+    if args.mode == "train":
+        train(
+            npy_path=args.npy_path,
+            save_path=args.save_path,
+            emb_dim=args.emb_dim,
+            hidden_dim=args.hidden_dim,
+            out_dim=args.out_dim,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            lr=args.lr,
+            num_workers=args.num_workers,
+            max_steps_per_epoch=args.max_steps_per_epoch,
+        )
+
+    elif args.mode == "transform":
+        transform_to_embedding(
+            npy_path=args.npy_path,
+            ckpt_path=args.save_path,
+            out_npy_path=args.out_npy_path,
+            batch_size=args.batch_size,
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
+
 
 if __name__ == "__main__":
-
-    equipment_list = [
-        {
-            "PIN01": "PART_A",
-            "PIN02": "PART_A",
-            "PIN10": "PART_B",
-        },
-        {
-            "PIN01": "PART_A",
-            "PIN03": "PART_A",
-            "PIN11": "PART_B",
-        },
-        {
-            "PIN20": "PART_C",
-            "PIN21": "PART_C",
-            "PIN22": "PART_D",
-        },
-    ]
-
-    model, pin2id, part2id = train_equipment_embedder(
-        equipment_list,
-        emb_dim=32,
-        out_dim=32,
-        batch_size=2,
-        epochs=100,
-        lr=1e-3,
-    )
-
-    Z = transform_equipment(
-        equipment_list,
-        model,
-        pin2id,
-        part2id
-    )
-
-    print(Z.shape)
-    print(Z)
-
-    np.save("equipment_embedding.npy", Z)
-    
-    
-def batch_domain_similarity(
-    pair_ids,
-    mask,
-    w_pin=0.7,
-    w_pair=0.2,
-    w_part=0.1,
-):
-    """
-    pair_ids: (B, L, 2)
-              pair_ids[..., 0] = part_id
-              pair_ids[..., 1] = pin_id
-    mask: (B, L)
-
-    similarity =
-        w_pin  * pin overlap
-      + w_pair * exact (part,pin) overlap
-      + w_part * part overlap
-    """
-
-    B, L, _ = pair_ids.shape
-    sim = torch.zeros(B, B, device=pair_ids.device)
-
-    pair_ids_cpu = pair_ids.detach().cpu()
-    mask_cpu = mask.detach().cpu()
-
-    pin_sets = []
-    part_sets = []
-    pair_sets = []
-
-    for i in range(B):
-        valid = mask_cpu[i].bool()
-        pairs = pair_ids_cpu[i, valid]
-
-        part_set = set(int(p[0]) for p in pairs)
-        pin_set = set(int(p[1]) for p in pairs)
-        pair_set = set((int(p[0]), int(p[1])) for p in pairs)
-
-        pin_sets.append(pin_set)
-        part_sets.append(part_set)
-        pair_sets.append(pair_set)
-
-    for i in range(B):
-        for j in range(B):
-            pin_sim = jaccard(pin_sets[i], pin_sets[j])
-            part_sim = jaccard(part_sets[i], part_sets[j])
-            pair_sim = jaccard(pair_sets[i], pair_sets[j])
-
-            sim[i, j] = (
-                w_pin * pin_sim
-                + w_pair * pair_sim
-                + w_part * part_sim
-            )
-
-    return sim
-
-
-def jaccard(a, b):
-    union = len(a | b)
-    if union == 0:
-        return 0.0
-    return len(a & b) / union
-    
+    main()
