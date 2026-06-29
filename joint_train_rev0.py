@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 class PinPartAssignEncoder(nn.Module):
     def __init__(self, num_parts=17, num_pins=44, emb_dim=32, hidden_dim=64, out_dim=32):
         super().__init__()
+
         self.num_parts = num_parts
         self.none_id = num_parts
 
@@ -91,16 +92,21 @@ def load_frozen_pinpart_encoder(path, device):
 
 class TupleTransitionDataset(Dataset):
     """
-    data_list:
-        [
-            (assign, before, after, action),
-            ...
-        ]
+    data_list item:
+        (assign, before, after, action)
 
-    assign: (44,), -1 or part_id
-    before: (N, M), full rectangular matrix
-    after:  (N, M), full rectangular matrix
-    action: int, 0~action_dim-1
+    assign: (N, 44)
+        row별 pin/parts condition
+        -1 or part_id
+
+    before: (N, M)
+        row = parameter
+        column = position
+
+    after: (N, M)
+
+    action:
+        int, 0 ~ action_dim-1
     """
 
     def __init__(self, data_list):
@@ -117,9 +123,12 @@ class TupleTransitionDataset(Dataset):
         after = torch.as_tensor(after, dtype=torch.float32)
         action = torch.tensor(int(action), dtype=torch.long)
 
-        assert assign.shape == (44,)
+        assert assign.ndim == 2
+        assert assign.shape[1] == 44
         assert before.ndim == 2
         assert after.ndim == 2
+        assert assign.shape[0] == before.shape[0]
+        assert assign.shape[0] == after.shape[0]
 
         return assign, before, after, action
 
@@ -129,32 +138,37 @@ def collate_matrix_batch(batch):
 
     B = len(batch)
 
-    max_rows = max(max(x.shape[0], y.shape[0]) for x, y in zip(befores, afters))
+    max_rows = max(x.shape[0] for x in assigns)
     max_cols = max(max(x.shape[1], y.shape[1]) for x, y in zip(befores, afters))
 
-    assign_batch = torch.stack(assigns, dim=0)
+    assign_batch = torch.full(
+        (B, max_rows, 44),
+        fill_value=-1,
+        dtype=torch.long,
+    )
 
     before_batch = torch.zeros(B, max_rows, max_cols, dtype=torch.float32)
     after_batch = torch.zeros(B, max_rows, max_cols, dtype=torch.float32)
 
-    before_row_mask = torch.zeros(B, max_rows, dtype=torch.float32)
-    after_row_mask = torch.zeros(B, max_rows, dtype=torch.float32)
-
     before_col_mask = torch.zeros(B, max_rows, max_cols, dtype=torch.float32)
     after_col_mask = torch.zeros(B, max_rows, max_cols, dtype=torch.float32)
 
-    for i, (before, after) in enumerate(zip(befores, afters)):
-        n0, m0 = before.shape
-        n1, m1 = after.shape
+    row_mask = torch.zeros(B, max_rows, dtype=torch.float32)
 
-        before_batch[i, :n0, :m0] = before
-        after_batch[i, :n1, :m1] = after
+    for i, (assign, before, after) in enumerate(zip(assigns, befores, afters)):
+        n = assign.shape[0]
+        m0 = before.shape[1]
+        m1 = after.shape[1]
 
-        before_row_mask[i, :n0] = 1.0
-        after_row_mask[i, :n1] = 1.0
+        assign_batch[i, :n] = assign
 
-        before_col_mask[i, :n0, :m0] = 1.0
-        after_col_mask[i, :n1, :m1] = 1.0
+        before_batch[i, :n, :m0] = before
+        after_batch[i, :n, :m1] = after
+
+        before_col_mask[i, :n, :m0] = 1.0
+        after_col_mask[i, :n, :m1] = 1.0
+
+        row_mask[i, :n] = 1.0
 
     actions = torch.stack(actions, dim=0)
 
@@ -162,10 +176,9 @@ def collate_matrix_batch(batch):
         "assign": assign_batch,
         "before": before_batch,
         "after": after_batch,
-        "before_row_mask": before_row_mask,
-        "after_row_mask": after_row_mask,
         "before_col_mask": before_col_mask,
         "after_col_mask": after_col_mask,
+        "row_mask": row_mask,
         "action": actions,
     }
 
@@ -178,7 +191,7 @@ class RowSignalEncoder(nn.Module):
     """
     row 하나 = parameter signal, shape (M,)
     M 가변 대응:
-        Conv1D + masked adaptive-like pooling
+        Conv1D + masked pooling
     """
 
     def __init__(self, token_dim=32, hidden_dim=64):
@@ -193,12 +206,13 @@ class RowSignalEncoder(nn.Module):
             nn.ReLU(),
         )
 
-        self.out_norm = nn.LayerNorm(token_dim)
+        self.norm = nn.LayerNorm(token_dim)
 
     def forward(self, x, col_mask):
         """
         x:        (B, N, M)
         col_mask: (B, N, M)
+
         return:
             row_tokens:  (B, N, D)
             row_anomaly: (B, N)
@@ -207,17 +221,17 @@ class RowSignalEncoder(nn.Module):
         B, N, M = x.shape
 
         x_flat = x.reshape(B * N, 1, M)
-        h = self.conv(x_flat)              # (B*N, D, M)
-        h = h.transpose(1, 2)              # (B*N, M, D)
+        h = self.conv(x_flat)
+        h = h.transpose(1, 2)  # (B*N, M, D)
 
         mask_flat = col_mask.reshape(B * N, M)
         h = h * mask_flat.unsqueeze(-1)
 
         denom = mask_flat.sum(dim=1, keepdim=True).clamp(min=1.0)
-        pooled = h.sum(dim=1) / denom      # (B*N, D)
+        pooled = h.sum(dim=1) / denom
 
         row_tokens = pooled.reshape(B, N, -1)
-        row_tokens = self.out_norm(row_tokens)
+        row_tokens = self.norm(row_tokens)
 
         row_anomaly = (
             x.abs() * col_mask
@@ -227,10 +241,10 @@ class RowSignalEncoder(nn.Module):
 
 
 # =========================================================
-# 4. Row-wise MIL Offline Q Model
+# 4. Main Model
 # =========================================================
 
-class RowWiseMatrixMILOfflineQ(nn.Module):
+class RowWiseAssignMatrixOfflineQ(nn.Module):
     def __init__(
         self,
         frozen_pinpart_encoder,
@@ -242,6 +256,7 @@ class RowWiseMatrixMILOfflineQ(nn.Module):
         super().__init__()
 
         self.pinpart_encoder = frozen_pinpart_encoder
+        self.action_dim = action_dim
 
         self.row_encoder = RowSignalEncoder(
             token_dim=token_dim,
@@ -279,7 +294,7 @@ class RowWiseMatrixMILOfflineQ(nn.Module):
 
     def forward(self, assign, matrix, row_mask, col_mask):
         """
-        assign:   (B, 44)
+        assign:   (B, N, 44)
         matrix:   (B, N, M)
         row_mask: (B, N)
         col_mask: (B, N, M)
@@ -289,18 +304,31 @@ class RowWiseMatrixMILOfflineQ(nn.Module):
             q_values: (B, action_dim)
         """
 
-        with torch.no_grad():
-            pin_tokens, pin_mask = self.pinpart_encoder.forward_tokens(assign)
+        B, N, P = assign.shape
 
         row_tokens, row_anomaly = self.row_encoder(matrix, col_mask)
 
+        # row별 assign을 flatten해서 pin tokens 생성
+        assign_flat = assign.reshape(B * N, P)
+
+        with torch.no_grad():
+            pin_tokens, pin_mask = self.pinpart_encoder.forward_tokens(assign_flat)
+
+        # row별 cross attention
+        query = row_tokens.reshape(B * N, 1, -1)
+        key = pin_tokens
+        value = pin_tokens
+
         context, cross_weights = self.cross_attn(
-            query=row_tokens,
-            key=pin_tokens,
-            value=pin_tokens,
+            query=query,
+            key=key,
+            value=value,
             key_padding_mask=(pin_mask == 0),
             need_weights=True,
         )
+
+        context = context.reshape(B, N, -1)
+        cross_weights = cross_weights.reshape(B, N, 1, P).squeeze(2)
 
         row_context = row_tokens + context
 
@@ -356,7 +384,8 @@ class RowWiseMatrixMILOfflineQ(nn.Module):
     @torch.no_grad()
     def select_action(self, assign, matrix, row_mask, col_mask):
         out = self.forward(assign, matrix, row_mask, col_mask)
-        return out["q_values"].argmax(dim=-1), out
+        action = out["q_values"].argmax(dim=-1)
+        return action, out
 
 
 # =========================================================
@@ -368,19 +397,18 @@ def compute_rowwise_reward(
     model,
     assign,
     before,
-    before_row_mask,
     before_col_mask,
     after,
-    after_row_mask,
     after_col_mask,
+    row_mask,
     risk_coef=0.5,
     anomaly_coef=0.5,
     new_bad_coef=0.2,
     margin=0.02,
     fail_threshold=0.3,
 ):
-    out_b = model(assign, before, before_row_mask, before_col_mask)
-    out_a = model(assign, after, after_row_mask, after_col_mask)
+    out_b = model(assign, before, row_mask, before_col_mask)
+    out_a = model(assign, after, row_mask, after_col_mask)
 
     risk_b = out_b["row_risk"].detach()
     risk_a = out_a["row_risk"].detach()
@@ -388,16 +416,7 @@ def compute_rowwise_reward(
     anom_b = out_b["row_anomaly"].detach()
     anom_a = out_a["row_anomaly"].detach()
 
-    N = min(risk_b.size(1), risk_a.size(1))
-
-    risk_b = risk_b[:, :N]
-    risk_a = risk_a[:, :N]
-    anom_b = anom_b[:, :N]
-    anom_a = anom_a[:, :N]
-
-    mask_b = before_row_mask[:, :N]
-    mask_a = after_row_mask[:, :N]
-    valid = mask_b * mask_a
+    valid = row_mask
 
     fail_weight = risk_b * valid
     denom = fail_weight.sum(dim=1).clamp(min=1e-6)
@@ -496,24 +515,22 @@ def train_epoch(model, loader, optimizer, device, cql_alpha=0.1):
         assign = batch["assign"].to(device)
         before = batch["before"].to(device)
         after = batch["after"].to(device)
-        before_row_mask = batch["before_row_mask"].to(device)
-        after_row_mask = batch["after_row_mask"].to(device)
         before_col_mask = batch["before_col_mask"].to(device)
         after_col_mask = batch["after_col_mask"].to(device)
+        row_mask = batch["row_mask"].to(device)
         action = batch["action"].to(device)
 
         reward, rinfo = compute_rowwise_reward(
             model=model,
             assign=assign,
             before=before,
-            before_row_mask=before_row_mask,
             before_col_mask=before_col_mask,
             after=after,
-            after_row_mask=after_row_mask,
             after_col_mask=after_col_mask,
+            row_mask=row_mask,
         )
 
-        out = model(assign, before, before_row_mask, before_col_mask)
+        out = model(assign, before, row_mask, before_col_mask)
 
         loss, qlog = conservative_q_loss(
             q_values=out["q_values"],
@@ -557,20 +574,18 @@ def evaluate(model, loader, device):
         assign = batch["assign"].to(device)
         before = batch["before"].to(device)
         after = batch["after"].to(device)
-        before_row_mask = batch["before_row_mask"].to(device)
-        after_row_mask = batch["after_row_mask"].to(device)
         before_col_mask = batch["before_col_mask"].to(device)
         after_col_mask = batch["after_col_mask"].to(device)
+        row_mask = batch["row_mask"].to(device)
 
         reward, rinfo = compute_rowwise_reward(
             model=model,
             assign=assign,
             before=before,
-            before_row_mask=before_row_mask,
             before_col_mask=before_col_mask,
             after=after,
-            after_row_mask=after_row_mask,
             after_col_mask=after_col_mask,
+            row_mask=row_mask,
         )
 
         bs = assign.size(0)
@@ -587,17 +602,21 @@ def evaluate(model, loader, device):
 
 
 # =========================================================
-# 8. Load data
+# 8. Data Load
 # =========================================================
 
 def load_tuple_data(path):
     """
-    pickle file containing:
+    pickle file:
         list of (assign, before, after, action)
+
+    assign: (N, 44)
+    before: (N, M)
+    after:  (N, M)
+    action: int
     """
     with open(path, "rb") as f:
-        data = pickle.load(f)
-    return data
+        return pickle.load(f)
 
 
 # =========================================================
@@ -611,19 +630,18 @@ def main():
     parser.add_argument("--pinpart_ckpt", type=str, required=True)
 
     parser.add_argument("--action_dim", type=int, default=4)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--cql_alpha", type=float, default=0.1)
 
-    parser.add_argument("--save_path", type=str, default="rowwise_matrix_mil_offline_q.pt")
+    parser.add_argument("--save_path", type=str, default="rowwise_assign_matrix_offline_q.pt")
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data_list = load_tuple_data(args.data_pkl)
-
     dataset = TupleTransitionDataset(data_list)
 
     loader = DataLoader(
@@ -640,7 +658,7 @@ def main():
         device,
     )
 
-    model = RowWiseMatrixMILOfflineQ(
+    model = RowWiseAssignMatrixOfflineQ(
         frozen_pinpart_encoder=frozen_encoder,
         token_dim=32,
         row_hidden_dim=128,
