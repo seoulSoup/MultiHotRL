@@ -1,229 +1,245 @@
-import os
-import time
 import argparse
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from torch.distributions import Categorical
 
 
 # =========================================================
-# Dataset
+# 1. Frozen Pin/Part Encoder
 # =========================================================
 
-class JointSetEmbeddingDataset(Dataset):
-    def __init__(
-        self,
-        meas_npy_path,
-        meas_len_npy_path,
-        equip_emb_path,
-        label_path,
-        mmap=True,
-    ):
-        """
-        meas_npy_path:
-            padded measurement array
-            shape = (N, M_max, meas_dim)
-
-        meas_len_npy_path:
-            valid row length
-            shape = (N,)
-
-        equip_emb_path:
-            pretrained equipment embedding
-            shape = (N, equip_dim)
-
-        label_path:
-            Pass/Fail label
-            shape = (N,)
-        """
-
-        self.meas = np.load(meas_npy_path, mmap_mode="r" if mmap else None)
-        self.meas_len = np.load(meas_len_npy_path, mmap_mode="r" if mmap else None)
-        self.equip_emb = np.load(equip_emb_path, mmap_mode="r" if mmap else None)
-        self.labels = np.load(label_path, mmap_mode="r" if mmap else None)
-
-        assert len(self.meas) == len(self.equip_emb) == len(self.labels)
-        assert len(self.meas_len) == len(self.meas)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        meas = torch.from_numpy(np.asarray(self.meas[idx])).float()
-        meas_len = int(self.meas_len[idx])
-
-        equip = torch.from_numpy(np.asarray(self.equip_emb[idx])).float()
-        label = torch.tensor(float(self.labels[idx]), dtype=torch.float32)
-
-        return meas, meas_len, equip, label
-
-
-def joint_collate_fn(batch):
-    meas, meas_len, equip, label = zip(*batch)
-
-    meas = torch.stack(meas, dim=0)
-    equip = torch.stack(equip, dim=0)
-    label = torch.stack(label, dim=0)
-
-    B, M_max, _ = meas.shape
-    meas_len = torch.tensor(meas_len, dtype=torch.long)
-
-    mask = torch.arange(M_max).unsqueeze(0) < meas_len.unsqueeze(1)
-    mask = mask.float()
-
-    return meas, mask, equip, label
-
-
-# =========================================================
-# Row-wise Set Encoder
-# =========================================================
-
-class RowWiseSetEncoder(nn.Module):
-    def __init__(
-        self,
-        meas_dim,
-        hidden_dim=128,
-        out_dim=128,
-    ):
+class PinPartAssignEncoder(nn.Module):
+    def __init__(self, num_parts=17, num_pins=44, emb_dim=32, hidden_dim=64, out_dim=32):
         super().__init__()
+        self.num_parts = num_parts
+        self.num_pins = num_pins
+        self.none_id = num_parts
 
-        self.row_mlp = nn.Sequential(
-            nn.Linear(meas_dim, hidden_dim),
+        self.part_emb = nn.Embedding(num_parts + 1, emb_dim)
+        self.pin_emb = nn.Embedding(num_pins, emb_dim)
+
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(emb_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, emb_dim),
             nn.ReLU(),
         )
 
         self.out_proj = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + 1, hidden_dim),
+            nn.Linear(emb_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, out_dim),
-            nn.ReLU(),
         )
 
-    def forward(self, x, mask):
+    def forward_tokens(self, assign):
         """
-        x:    (B, M, meas_dim), standard-scaled measurement
-        mask: (B, M)
+        assign: (B, 44), -1 or part_id
+        return: pin/part tokens (B, 44, emb_dim)
         """
+        B, num_pins = assign.shape
+        device = assign.device
 
-        h = self.row_mlp(x)
-        h = h * mask.unsqueeze(-1)
+        mask = (assign >= 0).float()
 
-        count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-
-        mean_pool = h.sum(dim=1) / count
-
-        h_max = h.masked_fill(mask.unsqueeze(-1) == 0, -1e9)
-        max_pool = h_max.max(dim=1).values
-
-        row_anomaly = x.abs().mean(dim=-1) * mask
-        anomaly_score = row_anomaly.sum(dim=1, keepdim=True) / count
-
-        anomaly_weight = row_anomaly.masked_fill(mask == 0, -1e9)
-        anomaly_weight = torch.softmax(anomaly_weight, dim=1)
-
-        anomaly_pool = (h * anomaly_weight.unsqueeze(-1)).sum(dim=1)
-
-        z = torch.cat(
-            [
-                mean_pool,
-                max_pool,
-                anomaly_pool,
-                anomaly_score,
-            ],
-            dim=-1,
+        part_ids = torch.where(
+            assign >= 0,
+            assign,
+            torch.full_like(assign, self.none_id),
         )
 
+        pin_ids = torch.arange(num_pins, device=device).unsqueeze(0).expand(B, -1)
+
+        part_e = self.part_emb(part_ids)
+        pin_e = self.pin_emb(pin_ids)
+
+        token = self.pair_mlp(torch.cat([part_e, pin_e], dim=-1))
+        token = token + pin_e
+        token = token * mask.unsqueeze(-1)
+
+        return token, mask
+
+    def encode(self, assign):
+        token, mask = self.forward_tokens(assign)
+        z = token.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp(min=1.0)
         z = self.out_proj(z)
+        z = F.normalize(z, dim=-1)
+        return z
 
-        aux = {
-            "row_anomaly": row_anomaly,
-            "anomaly_weight": anomaly_weight,
-            "global_anomaly_score": anomaly_score.squeeze(-1),
-        }
 
-        return z, aux
+def load_frozen_pinpart_encoder(ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    model = PinPartAssignEncoder(
+        num_parts=ckpt["num_parts"],
+        num_pins=ckpt["num_pins"],
+        emb_dim=ckpt["emb_dim"],
+        hidden_dim=ckpt["hidden_dim"],
+        out_dim=ckpt["out_dim"],
+    ).to(device)
+
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    for p in model.parameters():
+        p.requires_grad = False
+
+    return model
 
 
 # =========================================================
-# Joint Pass/Fail + PPO Model
+# 2. Pin-conditioned MIL + PPO Model
 # =========================================================
 
-class JointPassFailPPOModel(nn.Module):
+class PinConditionedMILPPO(nn.Module):
     def __init__(
         self,
+        frozen_pinpart_encoder,
         meas_dim,
-        equip_dim=32,
-        set_hidden_dim=128,
-        set_out_dim=128,
-        fusion_dim=128,
+        token_dim=32,
+        row_hidden_dim=128,
+        mil_hidden_dim=128,
         action_dim=4,
+        noisy_or_alpha=0.5,
     ):
         super().__init__()
 
-        self.set_encoder = RowWiseSetEncoder(
-            meas_dim=meas_dim,
-            hidden_dim=set_hidden_dim,
-            out_dim=set_out_dim,
-        )
+        self.pinpart_encoder = frozen_pinpart_encoder
+        self.noisy_or_alpha = noisy_or_alpha
 
-        self.equip_encoder = nn.Sequential(
-            nn.Linear(equip_dim, fusion_dim),
+        self.row_encoder = nn.Sequential(
+            nn.Linear(meas_dim, row_hidden_dim),
             nn.ReLU(),
-            nn.LayerNorm(fusion_dim),
-        )
-
-        self.fusion = nn.Sequential(
-            nn.Linear(set_out_dim + fusion_dim, fusion_dim),
-            nn.ReLU(),
-            nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, fusion_dim),
+            nn.LayerNorm(row_hidden_dim),
+            nn.Linear(row_hidden_dim, token_dim),
             nn.ReLU(),
         )
 
-        self.passfail_head = nn.Linear(fusion_dim, 1)
-        self.policy_head = nn.Linear(fusion_dim, action_dim)
-        self.value_head = nn.Linear(fusion_dim, 1)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=token_dim,
+            num_heads=4,
+            batch_first=True,
+        )
 
-    def forward(self, meas_x, meas_mask, equip_emb):
-        z_set, aux = self.set_encoder(meas_x, meas_mask)
-        z_equip = self.equip_encoder(equip_emb)
+        self.row_risk_head = nn.Sequential(
+            nn.Linear(token_dim + 1, mil_hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(mil_hidden_dim),
+            nn.Linear(mil_hidden_dim, 1),
+        )
 
-        state = torch.cat([z_set, z_equip], dim=-1)
-        state = self.fusion(state)
+        self.attn_head = nn.Sequential(
+            nn.Linear(token_dim + 1, mil_hidden_dim),
+            nn.Tanh(),
+            nn.Linear(mil_hidden_dim, 1),
+        )
 
-        passfail_logit = self.passfail_head(state).squeeze(-1)
+        self.state_proj = nn.Sequential(
+            nn.Linear(token_dim + 3, mil_hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(mil_hidden_dim),
+            nn.Linear(mil_hidden_dim, mil_hidden_dim),
+            nn.ReLU(),
+        )
+
+        self.policy_head = nn.Linear(mil_hidden_dim, action_dim)
+        self.value_head = nn.Linear(mil_hidden_dim, 1)
+
+    def forward(self, assign, meas_x, meas_mask):
+        """
+        assign:    (B, 44)
+        meas_x:    (B, M, meas_dim), standard-scaled
+        meas_mask: (B, M)
+        """
+
+        with torch.no_grad():
+            pin_tokens, pin_mask = self.pinpart_encoder.forward_tokens(assign)
+
+        row_tokens = self.row_encoder(meas_x)
+
+        context, cross_weights = self.cross_attn(
+            query=row_tokens,
+            key=pin_tokens,
+            value=pin_tokens,
+            key_padding_mask=(pin_mask == 0),
+            need_weights=True,
+        )
+
+        row_context = row_tokens + context
+
+        row_anomaly = meas_x.abs().mean(dim=-1) * meas_mask
+        row_input = torch.cat([row_context, row_anomaly.unsqueeze(-1)], dim=-1)
+
+        row_logit = self.row_risk_head(row_input).squeeze(-1)
+        row_logit = row_logit.masked_fill(meas_mask == 0, -1e9)
+        row_prob = torch.sigmoid(row_logit) * meas_mask
+
+        # Noisy-OR MIL
+        safe_prob = (1.0 - row_prob).clamp(min=1e-6, max=1.0)
+        noisy_or_prob = 1.0 - torch.prod(
+            torch.where(meas_mask > 0, safe_prob, torch.ones_like(safe_prob)),
+            dim=1,
+        )
+
+        # Attention MIL
+        attn_logit = self.attn_head(row_input).squeeze(-1)
+        attn_logit = attn_logit.masked_fill(meas_mask == 0, -1e9)
+        row_attn = torch.softmax(attn_logit, dim=1)
+
+        attn_prob = (row_attn * row_prob).sum(dim=1)
+
+        bag_prob = (
+            self.noisy_or_alpha * noisy_or_prob
+            + (1.0 - self.noisy_or_alpha) * attn_prob
+        )
+
+        bag_prob = bag_prob.clamp(min=1e-6, max=1.0 - 1e-6)
+
+        pooled_row = (row_context * row_attn.unsqueeze(-1)).sum(dim=1)
+
+        global_anomaly = (
+            row_anomaly.sum(dim=1)
+            / meas_mask.sum(dim=1).clamp(min=1.0)
+        ).unsqueeze(-1)
+
+        max_row_prob = row_prob.max(dim=1).values.unsqueeze(-1)
+        bag_prob_feat = bag_prob.unsqueeze(-1)
+
+        state = torch.cat(
+            [pooled_row, global_anomaly, max_row_prob, bag_prob_feat],
+            dim=-1,
+        )
+
+        state = self.state_proj(state)
+
         action_logits = self.policy_head(state)
         value = self.value_head(state).squeeze(-1)
 
         return {
+            "bag_prob": bag_prob,
+            "row_prob": row_prob,
+            "row_attn": row_attn,
+            "row_anomaly": row_anomaly,
+            "cross_weights": cross_weights,
             "state": state,
-            "passfail_logit": passfail_logit,
             "action_logits": action_logits,
             "value": value,
-            "aux": aux,
         }
 
     @torch.no_grad()
-    def act(self, meas_x, meas_mask, equip_emb, epsilon=0.05):
-        out = self.forward(meas_x, meas_mask, equip_emb)
-
-        logits = out["action_logits"]
-        dist = Categorical(logits=logits)
+    def act(self, assign, meas_x, meas_mask, epsilon=0.05):
+        out = self.forward(assign, meas_x, meas_mask)
+        dist = Categorical(logits=out["action_logits"])
 
         if np.random.rand() < epsilon:
             action = torch.randint(
                 0,
-                logits.size(-1),
-                size=(logits.size(0),),
-                device=logits.device,
+                out["action_logits"].size(-1),
+                size=(assign.size(0),),
+                device=assign.device,
             )
         else:
             action = dist.sample()
@@ -235,123 +251,98 @@ class JointPassFailPPOModel(nn.Module):
 
 
 # =========================================================
-# Train Pass/Fail
+# 3. Reward
 # =========================================================
 
-def train_passfail_epoch(
-    model,
-    loader,
-    optimizer,
-    device,
-    pos_weight=None,
-):
-    model.train()
-
-    pos_weight_tensor = None
-    if pos_weight is not None:
-        pos_weight_tensor = torch.tensor(
-            [pos_weight],
-            dtype=torch.float32,
-            device=device,
-        )
-
-    total_loss = 0.0
-    total_n = 0
-
-    for meas_x, meas_mask, equip_emb, label in loader:
-        meas_x = meas_x.to(device)
-        meas_mask = meas_mask.to(device)
-        equip_emb = equip_emb.to(device)
-        label = label.to(device)
-
-        out = model(meas_x, meas_mask, equip_emb)
-
-        loss = F.binary_cross_entropy_with_logits(
-            out["passfail_logit"],
-            label,
-            pos_weight=pos_weight_tensor,
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        bs = label.size(0)
-        total_loss += loss.item() * bs
-        total_n += bs
-
-    return total_loss / max(total_n, 1)
-
-
 @torch.no_grad()
-def evaluate_passfail(model, loader, device, threshold=0.5):
-    model.eval()
+def compute_improvement_reward(
+    model,
+    assign,
+    meas_before,
+    mask_before,
+    meas_after,
+    mask_after,
+    action_cost=None,
+    row_improve_coef=0.7,
+    bag_risk_coef=0.3,
+    new_bad_coef=0.2,
+):
+    """
+    reward =
+        0.7 * 기존 fail row의 anomaly 감소량
+      + 0.3 * 전체 bag risk 감소량
+      - 0.2 * 새 anomaly 증가 penalty
+      - action_cost
+    """
 
-    total = 0
-    correct = 0
-    tp = fp = tn = fn = 0
+    before = model(assign, meas_before, mask_before)
+    after = model(assign, meas_after, mask_after)
 
-    for meas_x, meas_mask, equip_emb, label in loader:
-        meas_x = meas_x.to(device)
-        meas_mask = meas_mask.to(device)
-        equip_emb = equip_emb.to(device)
-        label = label.to(device)
+    row_risk_before = before["row_prob"].detach()
 
-        out = model(meas_x, meas_mask, equip_emb)
-        prob = torch.sigmoid(out["passfail_logit"])
-        pred = (prob >= threshold).float()
+    anom_before = meas_before.abs().mean(dim=-1) * mask_before
+    anom_after = meas_after.abs().mean(dim=-1) * mask_after
 
-        correct += (pred == label).sum().item()
-        total += label.numel()
+    # 길이가 같다는 전제. 다르면 공통 길이만 비교.
+    M = min(anom_before.size(1), anom_after.size(1))
+    anom_before = anom_before[:, :M]
+    anom_after = anom_after[:, :M]
+    row_risk_before = row_risk_before[:, :M]
 
-        tp += ((pred == 1) & (label == 1)).sum().item()
-        fp += ((pred == 1) & (label == 0)).sum().item()
-        tn += ((pred == 0) & (label == 0)).sum().item()
-        fn += ((pred == 0) & (label == 1)).sum().item()
+    improvement = anom_before - anom_after
 
-    acc = correct / max(total, 1)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    weighted_improvement = (
+        row_risk_before * improvement
+    ).sum(dim=1) / row_risk_before.sum(dim=1).clamp(min=1e-6)
 
-    return {
-        "acc": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp,
-        "fp": fp,
-        "tn": tn,
-        "fn": fn,
+    bag_risk_reward = before["bag_prob"] - after["bag_prob"]
+
+    new_bad_penalty = F.relu(anom_after - anom_before).mean(dim=1)
+
+    reward = (
+        row_improve_coef * weighted_improvement
+        + bag_risk_coef * bag_risk_reward
+        - new_bad_coef * new_bad_penalty
+    )
+
+    if action_cost is not None:
+        reward = reward - action_cost.to(reward.device)
+
+    return reward, {
+        "weighted_improvement": weighted_improvement,
+        "bag_risk_before": before["bag_prob"],
+        "bag_risk_after": after["bag_prob"],
+        "bag_risk_reward": bag_risk_reward,
+        "new_bad_penalty": new_bad_penalty,
+        "row_risk_before": before["row_prob"],
+        "row_risk_after": after["row_prob"],
     }
 
 
 # =========================================================
-# PPO Update
+# 4. PPO Update
 # =========================================================
 
 def ppo_update(
     model,
     optimizer,
     batch,
-    device,
     clip_eps=0.2,
     value_coef=0.5,
     entropy_coef=0.01,
-    passfail_coef=0.2,
 ):
-    meas_x = batch["meas_x"].to(device)
-    meas_mask = batch["meas_mask"].to(device)
-    equip_emb = batch["equip_emb"].to(device)
+    assign = batch["assign"]
+    meas_x = batch["meas_x"]
+    meas_mask = batch["meas_mask"]
 
-    actions = batch["actions"].to(device)
-    old_log_probs = batch["old_log_probs"].to(device)
-    returns = batch["returns"].to(device)
-    advantages = batch["advantages"].to(device)
+    actions = batch["actions"]
+    old_log_probs = batch["old_log_probs"]
+    returns = batch["returns"]
+    advantages = batch["advantages"]
 
     advantages = (advantages - advantages.mean()) / advantages.std().clamp(min=1e-6)
 
-    out = model(meas_x, meas_mask, equip_emb)
+    out = model(assign, meas_x, meas_mask)
 
     dist = Categorical(logits=out["action_logits"])
     new_log_probs = dist.log_prob(actions)
@@ -367,18 +358,6 @@ def ppo_update(
 
     loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
-    passfail_loss = torch.tensor(0.0, device=device)
-
-    if "labels" in batch and batch["labels"] is not None:
-        labels = batch["labels"].to(device).float()
-
-        passfail_loss = F.binary_cross_entropy_with_logits(
-            out["passfail_logit"],
-            labels,
-        )
-
-        loss = loss + passfail_coef * passfail_loss
-
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -388,139 +367,122 @@ def ppo_update(
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
         "entropy": float(entropy.item()),
-        "passfail_loss": float(passfail_loss.item()),
     }
 
 
-@torch.no_grad()
-def reward_from_passfail(model, meas_x, meas_mask, equip_emb):
-    out = model(meas_x, meas_mask, equip_emb)
+# =========================================================
+# 5. Utility
+# =========================================================
 
-    p_pass = torch.sigmoid(out["passfail_logit"])
-
-    # [-1, +1]
-    reward = 2.0 * p_pass - 1.0
-
-    return reward
+def make_mask(lengths, max_len=None, device="cpu"):
+    if max_len is None:
+        max_len = int(lengths.max())
+    arange = torch.arange(max_len, device=device).unsqueeze(0)
+    return (arange < lengths.unsqueeze(1)).float()
 
 
 # =========================================================
-# Main
+# 6. Example
 # =========================================================
 
 def main():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--meas_npy", type=str, required=True)
-    parser.add_argument("--meas_len_npy", type=str, required=True)
-    parser.add_argument("--equip_emb_npy", type=str, required=True)
-    parser.add_argument("--label_npy", type=str, required=True)
-
-    parser.add_argument("--save_path", type=str, default="joint_passfail_ppo.pt")
-
+    parser.add_argument("--pinpart_ckpt", type=str, required=True)
     parser.add_argument("--meas_dim", type=int, required=True)
-    parser.add_argument("--equip_dim", type=int, default=32)
     parser.add_argument("--action_dim", type=int, default=4)
-
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--pos_weight", type=float, default=None)
-
+    parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = JointSetEmbeddingDataset(
-        meas_npy_path=args.meas_npy,
-        meas_len_npy_path=args.meas_len_npy,
-        equip_emb_path=args.equip_emb_npy,
-        label_path=args.label_npy,
-        mmap=True,
-    )
+    frozen_encoder = load_frozen_pinpart_encoder(args.pinpart_ckpt, device)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-        collate_fn=joint_collate_fn,
-        drop_last=False,
-    )
-
-    model = JointPassFailPPOModel(
+    model = PinConditionedMILPPO(
+        frozen_pinpart_encoder=frozen_encoder,
         meas_dim=args.meas_dim,
-        equip_dim=args.equip_dim,
-        set_hidden_dim=128,
-        set_out_dim=128,
-        fusion_dim=128,
+        token_dim=32,
+        row_hidden_dim=128,
+        mil_hidden_dim=128,
         action_dim=args.action_dim,
+        noisy_or_alpha=0.5,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=args.lr,
         weight_decay=1e-4,
     )
 
-    for epoch in range(1, args.epochs + 1):
-        start = time.time()
+    # -----------------------------
+    # Dummy online example
+    # 실제 환경에서는 아래 부분을 네 장비 loop로 교체
+    # -----------------------------
+    B = 8
+    M = 40
+    meas_dim = args.meas_dim
 
-        loss = train_passfail_epoch(
-            model=model,
-            loader=loader,
-            optimizer=optimizer,
-            device=device,
-            pos_weight=args.pos_weight,
-        )
+    assign = torch.randint(-1, 17, (B, 44), device=device)
+    assign[assign < 3] = -1
 
-        metric = evaluate_passfail(
-            model=model,
-            loader=loader,
-            device=device,
-            threshold=0.5,
-        )
+    meas_before = torch.randn(B, M, meas_dim, device=device)
+    meas_after = meas_before * 0.8 + 0.1 * torch.randn(B, M, meas_dim, device=device)
 
-        elapsed = time.time() - start
+    lengths = torch.full((B,), M, device=device)
+    mask = make_mask(lengths, max_len=M, device=device)
 
-        print(
-            f"[Epoch {epoch:03d}] "
-            f"loss={loss:.6f} "
-            f"acc={metric['acc']:.4f} "
-            f"precision={metric['precision']:.4f} "
-            f"recall={metric['recall']:.4f} "
-            f"f1={metric['f1']:.4f} "
-            f"tp={metric['tp']} fp={metric['fp']} "
-            f"tn={metric['tn']} fn={metric['fn']} "
-            f"time={elapsed:.1f}s"
-        )
+    action, old_log_prob, value, out_before = model.act(
+        assign,
+        meas_before,
+        mask,
+        epsilon=0.05,
+    )
 
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "meas_dim": args.meas_dim,
-                "equip_dim": args.equip_dim,
-                "action_dim": args.action_dim,
-                "epoch": epoch,
-                "loss": loss,
-            },
-            args.save_path,
-        )
+    reward, reward_info = compute_improvement_reward(
+        model=model,
+        assign=assign,
+        meas_before=meas_before,
+        mask_before=mask,
+        meas_after=meas_after,
+        mask_after=mask,
+        action_cost=None,
+    )
 
-    print("saved:", args.save_path)
+    returns = reward
+    advantages = reward - value.detach()
+
+    batch = {
+        "assign": assign,
+        "meas_x": meas_before,
+        "meas_mask": mask,
+        "actions": action,
+        "old_log_probs": old_log_prob.detach(),
+        "returns": returns.detach(),
+        "advantages": advantages.detach(),
+    }
+
+    log = ppo_update(
+        model=model,
+        optimizer=optimizer,
+        batch=batch,
+    )
+
+    print("action:", action)
+    print("reward:", reward)
+    print("bag_risk_before:", reward_info["bag_risk_before"])
+    print("bag_risk_after:", reward_info["bag_risk_after"])
+    print("ppo_log:", log)
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "meas_dim": args.meas_dim,
+            "action_dim": args.action_dim,
+        },
+        "pin_conditioned_mil_ppo.pt",
+    )
 
 
 if __name__ == "__main__":
     main()
     
     
-    python joint_passfail_ppo.py \
-  --meas_npy meas_padded.npy \
-  --meas_len_npy meas_len.npy \
-  --equip_emb_npy pinpart_embedding.npy \
-  --label_npy labels.npy \
-  --meas_dim 8 \
-  --equip_dim 32 \
-  --batch_size 256 \
-  --epochs 20
